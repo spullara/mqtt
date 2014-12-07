@@ -1,5 +1,11 @@
 package fdb.mqtt;
 
+import com.foundationdb.Database;
+import com.foundationdb.FDB;
+import com.foundationdb.MutationType;
+import com.foundationdb.directory.DirectoryLayer;
+import com.foundationdb.directory.DirectorySubspace;
+import com.google.common.primitives.Longs;
 import com.sampullara.cli.Argument;
 import org.eclipse.paho.client.mqttv3.MqttClient;
 import org.eclipse.paho.client.mqttv3.MqttException;
@@ -12,20 +18,29 @@ import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
+
+import static java.util.Arrays.asList;
 
 /**
  * Start with the simplest implementation possible that passes the benchmark.
  */
 public class MQTTServer {
 
+  private static final byte[] ONE_BYTES = Longs.toByteArray(1);
   @Argument(alias = "p", description = "Port to listen on")
   private static Integer port = 1883;
+
+  @Argument(alias = "c", description = "FDB cluster file")
+  private static String cluster;
+
+  @Argument(alias = "n", description = "MQTT namespace")
+  private static String namespace = "default";
 
   enum QoS {
     AT_MOST_ONCE_DELIVERY,
@@ -53,7 +68,7 @@ public class MQTTServer {
   }
 
   enum ConnectionReturnCode {
-    ACCPTED,
+    ACCEPTED,
     REFUSED_VERSION,
     REFUSED_IDENTIFIER,
     REFUSED_SERVER_UNAVAILABLE,
@@ -64,7 +79,22 @@ public class MQTTServer {
   private static byte[] PROTOCOL_NAME = "MQTT".getBytes();
 
   public static void main(String[] args) throws IOException, MqttException, InterruptedException {
-    Map<String, byte[]> retainedMessages = new ConcurrentHashMap<>();
+    FDB fdb = FDB.selectAPIVersion(200);
+    Database db = fdb.open(cluster);
+    DirectoryLayer dl = DirectoryLayer.getDefault();
+    DirectorySubspace subspace = dl.createOrOpen(db, asList("mqtt", namespace)).get();
+    byte[] nextIdKey = subspace.get("nextId").pack();
+    byte[] numTopicsKey = subspace.get("numTopics").pack();
+
+    // client id / topic -> last message id read
+    DirectorySubspace sessions = subspace.createOrOpen(db, asList("sessions")).get();
+    // topic -> message
+    DirectorySubspace retained = subspace.createOrOpen(db, asList("retained")).get();
+    // topic / message id -> message
+    DirectorySubspace messages = subspace.createOrOpen(db, asList("messages")).get();
+    // topic -> number of messages
+    DirectorySubspace topics = subspace.createOrOpen(db, asList("topics")).get();
+
     ExecutorService executorService = Executors.newCachedThreadPool();
     executorService.submit(() -> {
       ServerSocket serverSocket = new ServerSocket(port);
@@ -79,14 +109,12 @@ public class MQTTServer {
 
             DataInputStream dis = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
             DataOutputStream dos = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
-
             while (true) {
               // Read the fixed header
               int headerbyte1 = dis.read();
               int packetType = headerbyte1 >> 4;
               int flags = headerbyte1 & 0x0F;
               AtomicInteger remainingLength = new AtomicInteger(readEncodedLength(dis));
-
               switch (PacketType.values()[packetType]) {
                 case CONNECT: {
                   assertFlags(flags, 0);
@@ -124,7 +152,7 @@ public class MQTTServer {
                       password = readBytes(dis);
                     }
                   }
-                  writeConnAck(dos, cleanSession, ConnectionReturnCode.ACCPTED);
+                  writeConnAck(dos, cleanSession, ConnectionReturnCode.ACCEPTED);
                   socket.setSoTimeout((int) (keepAlive * 1.5) * 1000);
                   break;
                 }
@@ -144,9 +172,26 @@ public class MQTTServer {
                   } else if (duplicate) {
                     throw new ProtocolException("Can't have qos = 0 and duplicates");
                   }
-                  byte[] bytes = new byte[remainingLength.intValue()];
-                  dis.readFully(bytes);
-                  System.out.println(new String(bytes));
+                  byte[] message = new byte[remainingLength.intValue()];
+                  dis.readFully(message);
+                  db.run(tx -> {
+                    byte[] nextIdBytes = tx.get(nextIdKey).get();
+                    long id;
+                    if (nextIdBytes == null) {
+                      id = 0;
+                      tx.set(nextIdKey, Longs.toByteArray(1));
+                    } else {
+                      id = Longs.fromByteArray(nextIdBytes);
+                      tx.mutate(MutationType.ADD, nextIdKey, ONE_BYTES);
+                    }
+                    tx.mutate(MutationType.ADD, topics.get(topicName).pack(), ONE_BYTES);
+                    tx.set(messages.get(topicName).get(id).pack(), message);
+                    if (retain) {
+                      // TODO: handle special retain rules
+                      tx.set(retained.get(topicName).pack(), message);
+                    }
+                    return null;
+                  });
                   break;
                 }
                 case PUBACK: {
@@ -172,9 +217,18 @@ public class MQTTServer {
                 case SUBSCRIBE: {
                   assertFlags(flags, 2);
                   int packetId = readInt16(dis);
+                  remainingLength.addAndGet(-2);
                   if (remainingLength.intValue() == 0) {
                     throw new ProtocolException("Packet payload required");
                   }
+                  Map<String, QoS> topicFilters = new LinkedHashMap<>();
+                  do {
+                    String topicFilter = readUTF8(dis, remainingLength);
+                    QoS qos = QoS.values()[dis.read()];
+                    remainingLength.decrementAndGet();
+                    topicFilters.put(topicFilter, qos);
+                  } while (remainingLength.longValue() > 0);
+                  writeSubAck(packetId, topicFilters);
                   break;
                 }
                 case SUBACK: {
@@ -233,6 +287,10 @@ public class MQTTServer {
     System.out.println("Connected");
     test.publish("mytopic", "message".getBytes(), 0, false);
 
+  }
+
+  private static void writeSubAck(int packetId, Map<String, QoS> topicFilters) {
+    
   }
 
   private static byte[] readBytes(DataInputStream dis) throws IOException {
